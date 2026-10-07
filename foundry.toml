@@ -1,0 +1,25 @@
+# IMD6900 perps hook: the in-pool perps hook and its pool, launched through the IMD swarm on Robinhood Chain. Builds
+# offline: every library is vendored under lib/ (only what is imported). bytecode_hash = "none", as IMD's launches
+# require.
+[profile.default]
+src = "src"
+test = "test"
+script = "script"
+out = "out"
+libs = ["lib"]
+auto_detect_solc = true
+bytecode_hash = "none"
+optimizer = true
+optimizer_runs = 200
+via_ir = true
+evm_version = "cancun"
+remappings = [
+    "solady/=lib/solady/src/",
+    "@uniswap/v4-core/=lib/v4-core/",
+    "@uniswap/v4-periphery/=lib/v4-periphery/",
+    "forge-std/=lib/forge-std/src/",
+    "solmate/=lib/solmate/",
+]
+
+[rpc_endpoints]
+robinhood = "${ROBINHOOD_RPC_URL}"
