@@ -40,12 +40,31 @@ Read the deployed addresses from the launch contract: `pool()`, `hook()` and `sa
 
 ## After the launch (the owner)
 
-1. `pool.setFeeSink(<the coin's fee splitter>)`.
-2. `pool.open(coin, curve, sqrtPriceX96, tokens)` with ETH: the coin, its Pons curve, the curve's price, and the coin
-   to pair (approved first). What the price doesn't take comes back.
+The coin is launched by the swarm's Pons launcher (launch #1026, `0xE0aBb21F15766BE162429f46F494617eB5EF6Ba0`,
+magic0xfrens/imd6900-pons-launch), at `0x69005D86d2c1bb1dFE70Df48e27D6aa02D044149`. Its `launch(salt, coin, 2 ether,
+minOut)` dev-buys with 2 ETH of what the old IMDSTR pool's pull sent it and refunds the rest to the team wallet. That
+refund opens this pool. `script/Owner.s.sol` runs the steps from the team wallet:
+
+1. `open(<pool>, <wei>)`: releases from the launcher the coin worth `<wei>` at the Pons curve's price (the coin beyond
+   one per IMDSTR, which no holder can claim), and opens the pool at that price with the ETH.
+2. `wire(<pool>)`: the coin's creator fees split 70% pot bridge, 10% this pool (its `compound` turns them into depth),
+   20% the team; the pool's fee sink is the launcher.
 3. Deploy the perps engine and its vault against the open pool, then `hook.setPerpEngine(engine)` and
    `pool.setPerpEngine(engine)`.
 4. Hand both to the Robinhood timelock (`transferOwnership`).
+
+**The liquidity always comes back.** The pool contract owns all of it and its owner can take it all out with
+`removeLiquidity`; the hook only checks that the caller is the pool and the range is full, so no hook state can stop
+it. The one guard is the pool's own engine check (no withdrawal that leaves an open position liquidatable), which the
+owner can switch off with `pool.setPerpEngine(address(0))`. The hook is not upgradeable on purpose: a proxy needs
+DELEGATECALL, which IMD's admission refuses, and an upgradeable hook would let one key change everyone's trading rules.
+A new hook is a new launch: take the liquidity out, open the new pool with it.
+
+`test/RobinhoodFlow.fork.t.sol` (needs `ROBINHOOD_RPC_URL`) runs all of it on live Robinhood state: the launcher's
+2 ETH dev buy (525.7M coins, 0.8283 ETH refunded, 205.6M releasable), this launch as the swarm deploys it, the pool
+opened at the Pons price, trades through the hook and the band, the fee split feeding the pool, the owner taking all
+the liquidity back past a blocking and a broken engine, and a second hook opened with the same money. Pons taxes buys
+in the coin's launch block ~99% (anti-sniper; the launcher's own buy is exempt), 6.9% after.
 
 ## Admission (what IMD checks, and the tests that check it first)
 
@@ -53,7 +72,9 @@ Read the deployed addresses from the launch contract: `pool()`, `hook()` and `sa
 
 - `test_DeploysOnAFreshChain`: the launch deploys where nothing it names exists (IMD deploys a launch on a fresh chain
   first); the hook's address carries its flags, the pool and the hook name each other, both are the owner's.
-- `test_FitsOneTransaction`: the whole launch, the mining included, under EIP-7825's 2^24 gas.
+- `test_FitsOneTransaction`: the whole launch, the mining included, under EIP-7825's 2^24 gas. The mining depends on
+  the deployer's address: over 40 addresses it took ~17k tries on average at ~128 gas each (5.9M gas mean, 10.5M the
+  worst); the cap leaves room for ~95k tries, which one deployer in ~350 would need.
 - `test_EachDeployerMinesItsOwnSalt`: whatever address deploys it, it finds its own salt.
 - `test_PassesTheAdmissionScan`: no contract's code shows CALLCODE, DELEGATECALL or SELFDESTRUCT (PUSH data skipped).
 - `test_RefusesADynamicFee`: a dynamic fee would cost the pool Uniswap's automatic routing; the hook refuses it.
