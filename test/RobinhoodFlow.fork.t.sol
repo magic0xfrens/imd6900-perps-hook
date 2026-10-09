@@ -115,6 +115,8 @@ contract RobinhoodFlowForkTest is Test {
     Trader trader;
 
     function setUp() public {
+        // offline (as IMD's swarm builds it) there is no Robinhood to fork: skip rather than fail
+        if (bytes(vm.envOr("ROBINHOOD_RPC_URL", string(""))).length == 0) vm.skip(true);
         vm.createSelectFork(vm.rpcUrl("robinhood"));
         vm.deal(address(L), PULLED);
         uint256 before = DEPLOYER.balance;
