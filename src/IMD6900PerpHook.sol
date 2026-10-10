@@ -120,22 +120,24 @@ contract IMD6900PerpHook is BaseHook, Ownable {
     bool public sweepFailOpen;
     /// @notice The one pool this hook serves
     PoolId public poolId;
-    /// @notice Protocol-owned callers that trade without the fee, and without the skim
+    /// @notice Protocol-owned callers whose swaps the band does not judge (the engine model reads them as fee-free)
     mapping(address => bool) public feeExempt;
 
     /*                     FOLLOWING THE PONS PRICE                        */
 
-    /// @notice How hard the fee rises with the pool's distance from the Pons price, in basis points of that
-    ///         deviation. 9000 means a 10% gap adds 9% to the fee.
-    uint256 public skimBps = 9_000;
     /// @notice How far this pool's price may end up from the Pons curve's. A swap that would leave it further out
     ///         than this is refused — unless it moves the price closer, which is always allowed.
     /// @dev Wide on purpose while the pool is thin: at 0.12 ETH of depth a 0.01 ETH trade already moves the price
     ///      ~15%, so a tight band would refuse ordinary trades rather than manipulation. Tighten it as the pool
     ///      deepens — that is what turns the band into real protection for the perps mark.
     uint256 public maxDeviationBps = 3_000;
-    /// @dev Transient slot holding the deviation measured before the swap (cancun tstore/tload)
+    /// @dev Transient slot holding where the swap started against Pons (cancun tstore/tload): the deviation in the
+    ///      low bits, bit 255 set when the pool stood above the Pons price; UNTRACKED for the engine's own swaps
     uint256 internal constant DEV_SLOT = 0x9e;
+    uint256 internal constant ABOVE = 1 << 255;
+    uint256 internal constant UNTRACKED = type(uint256).max;
+    /// @dev What the band reads for a pool price it can't express (a sqrt price under 2^48): as far out as it gets
+    uint256 internal constant OFF_SCALE = 1e12;
     uint256 internal constant Q96 = 2 ** 96;
     /// @notice The pool's own fee, in hundredths of a bip (1e6 = 100%). Fixed at construction because a dynamic
     ///         fee is one of the three things that would cost this hook its automatic routing.
@@ -150,7 +152,7 @@ contract IMD6900PerpHook is BaseHook, Ownable {
     event FeeExemptSet(address indexed caller, bool exempt);
     event FeeAddressUpdated(address feeAddress);
     event FeeAddressRenounced(address by);
-    event SkimSet(uint256 skimBps, uint256 maxDeviationBps);
+    event BandSet(uint256 maxDeviationBps);
 
     error NotOurPool();
     error OnlyLauncher();
@@ -166,7 +168,9 @@ contract IMD6900PerpHook is BaseHook, Ownable {
     error SweepUnavailable();
     /// @notice The trade would leave this pool further from the Pons price than {maxDeviationBps}
     error TooFarFromPons();
-    error InvalidSkim();
+    error InvalidBand();
+    error ZeroAddress();
+    error NoRenounce();
 
     constructor(IPoolManager poolManager_, address launcher_, address feeAddress_, address owner_, uint24 poolFeePips_)
         BaseHook(poolManager_)
@@ -223,12 +227,16 @@ contract IMD6900PerpHook is BaseHook, Ownable {
         emit SweepFailOpenSet(on);
     }
 
-    /// @notice How much of an arbitrageur's profit this pool keeps, and how far the price may drift from Pons
-    function setSkim(uint256 skimBps_, uint256 maxDeviationBps_) external onlyOwner {
-        if (skimBps_ > BPS || maxDeviationBps_ == 0) revert InvalidSkim();
-        skimBps = skimBps_;
+    /// @notice How far the price may drift from Pons
+    function setBand(uint256 maxDeviationBps_) external onlyOwner {
+        if (maxDeviationBps_ == 0) revert InvalidBand();
         maxDeviationBps = maxDeviationBps_;
-        emit SkimSet(skimBps_, maxDeviationBps_);
+        emit BandSet(maxDeviationBps_);
+    }
+
+    /// @notice Ownership never goes to nobody: the engine, the band and the escape hatches need an owner
+    function renounceOwnership() public payable override onlyOwner {
+        revert NoRenounce();
     }
 
     function setFeeExempt(address caller, bool exempt) external onlyOwner {
@@ -238,6 +246,7 @@ contract IMD6900PerpHook is BaseHook, Ownable {
 
     function updateFeeAddress(address feeAddress_) external onlyOwner {
         if (feeAddressRenounced) revert FeeAddressIsRenounced();
+        if (feeAddress_ == address(0)) revert ZeroAddress();
         feeAddress = feeAddress_;
         emit FeeAddressUpdated(feeAddress_);
     }
@@ -259,7 +268,7 @@ contract IMD6900PerpHook is BaseHook, Ownable {
         if (amount == 0) return;
         uint256 toFeeAddress = feeAddressRenounced ? 0 : (amount * 3) / 100;
         IFeeSink(launcher).addFees{value: amount - toFeeAddress}();
-        if (toFeeAddress != 0) SafeTransferLib.forceSafeTransferETH(feeAddress, toFeeAddress);
+        if (toFeeAddress != 0) SafeTransferLib.safeTransferETH(feeAddress, toFeeAddress);
         emit FeesFlushed(amount - toFeeAddress, toFeeAddress);
     }
 
@@ -267,9 +276,18 @@ contract IMD6900PerpHook is BaseHook, Ownable {
     ///         all (before the pool is wired).
     /// @dev Two lives to follow. Before graduation the bonding curve is the market, and its reserves are the price.
     ///      At 4.2 ETH it graduates: the curve stops for good and trading moves to a Uniswap v4 pool of Pons' own,
-    ///      so the reference moves with it. Without this second leg the band and the skim would quietly switch
-    ///      themselves off the moment the coin succeeded, which is exactly when the gap is worth the most.
+    ///      so the reference moves with it. Without this second leg the band would quietly switch
+    ///      itself off the moment the coin succeeded, which is exactly when the gap is worth the most.
     function ponsPriceX96() public view returns (uint256) {
+        try this.ponsPriceUnchecked() returns (uint256 p) {
+            return p;
+        } catch {
+            return 0; // a reference we cannot read leaves the pool trading (band off), never reverts a swap
+        }
+    }
+
+    /// @notice {ponsPriceX96} without the guard: reverts if any read of the Pons market does (for that guard)
+    function ponsPriceUnchecked() external view returns (uint256) {
         address c = IPerpPoolView(launcher).curve();
         if (c == address(0)) return 0;
         if (!IPonsCurveView(c).graduated()) {
@@ -281,7 +299,7 @@ contract IMD6900PerpHook is BaseHook, Ownable {
     }
 
     /// @dev The price in Pons' graduated pool. Read through a try/catch: a reference we cannot read must leave the
-    ///      pool trading (band and skim simply off), never revert somebody's swap.
+    ///      pool trading (band simply off), never revert somebody's swap.
     function _graduatedPriceX96(address c) internal view returns (uint256) {
         try IPonsCurveView(c).factory() returns (address f) {
             PonsLaunchedToken memory l = IPonsFactoryView(f).getLaunchedToken(IPonsCurveView(c).token());
@@ -315,7 +333,8 @@ contract IMD6900PerpHook is BaseHook, Ownable {
     }
 
     function _deviation(uint256 pool_, uint256 ref) internal pure returns (uint256) {
-        if (ref == 0 || pool_ == 0) return 0;
+        if (ref == 0) return 0;
+        if (pool_ == 0) return OFF_SCALE;
         uint256 d = pool_ > ref ? pool_ - ref : ref - pool_;
         return (d * BPS) / ref;
     }
@@ -377,10 +396,15 @@ contract IMD6900PerpHook is BaseHook, Ownable {
         // perps: close what this trade would sink, at the price before it moves (MiFrens LIQ04-A)
         _sweep(sender, params.amountSpecified, params.zeroForOne, params.sqrtPriceLimitX96);
 
-        // remember how far from Pons we start, so afterSwap can tell a correction from a push
-        uint256 dev = tracksPons(sender) ? _deviation(poolPriceX96(), ponsPriceX96()) : type(uint256).max;
+        // remember how far from Pons we start, and on which side, so afterSwap can tell a correction from a push
+        uint256 start = UNTRACKED;
+        if (tracksPons(sender)) {
+            uint256 pool_ = poolPriceX96();
+            uint256 ref = ponsPriceX96();
+            start = _deviation(pool_, ref) | (pool_ > ref ? ABOVE : 0);
+        }
         assembly ("memory-safe") {
-            tstore(DEV_SLOT, dev)
+            tstore(DEV_SLOT, start)
         }
         return (BaseHook.beforeSwap.selector, BeforeSwapDeltaLibrary.ZERO_DELTA, 0); // the pool charges its own static fee
     }
@@ -390,9 +414,15 @@ contract IMD6900PerpHook is BaseHook, Ownable {
         override
         returns (bytes4, int128)
     {
-        // a second, best-effort sweep for anything the final price leaves under water
+        // the band first, on the price this trader left (read before the sweep: an engine's nested swap rewrites the
+        // slot, and its liquidations must neither hide a push nor be rolled back by the band)
+        uint256 start;
+        assembly ("memory-safe") {
+            start := tload(DEV_SLOT)
+        }
+        _checkBand(start);
+        // then a second, best-effort sweep for anything the final price leaves under water
         _sweep(sender, 0, false, 0);
-        _checkBand();
         return (BaseHook.afterSwap.selector, int128(0)); // the pool charged its own fee; this hook takes nothing
     }
 
@@ -400,16 +430,18 @@ contract IMD6900PerpHook is BaseHook, Ownable {
 
     /// @dev The band: a swap may not leave this pool further from the Pons price than {maxDeviationBps}, unless it
     ///      moved it closer. The engine is never subject to it — a liquidation must run whatever the price is doing.
-    function _checkBand() internal view {
-        uint256 devBefore;
-        assembly ("memory-safe") {
-            devBefore := tload(DEV_SLOT)
-        }
-        if (devBefore == type(uint256).max) return;
+    ///      Closer means closer on the same side: a trade that crosses the Pons price to the far side must end inside
+    ///      the band, so no "correction" can swing the pool through Pons and out the other way.
+    function _checkBand(uint256 start) internal view {
+        if (start == UNTRACKED) return;
         uint256 ref = ponsPriceX96();
         if (ref == 0) return;
-        uint256 devAfter = _deviation(poolPriceX96(), ref);
-        if (devAfter > maxDeviationBps && devAfter > devBefore) revert TooFarFromPons();
+        uint256 pool_ = poolPriceX96();
+        uint256 devAfter = _deviation(pool_, ref);
+        if (devAfter <= maxDeviationBps) return;
+        uint256 devBefore = start & ~ABOVE;
+        bool crossed = (start & ABOVE != 0) != (pool_ > ref);
+        if (devAfter > devBefore || crossed) revert TooFarFromPons();
     }
 
     function _checkLiquidity(address sender, ModifyLiquidityParams calldata params) internal view {
@@ -441,8 +473,13 @@ contract IMD6900PerpHook is BaseHook, Ownable {
             if (status != 0) revert SweepGasStarved();
         } else if (spec != 0) {
             // too little gas to sweep: refuse the trade while positions are open, rather than trade blind (MiFrens R1C)
+            // an engine that can't even say whether positions are open fails closed here too (unless fail-open is set)
             (bool ok, bytes memory ret) = engine.staticcall(abi.encodeCall(IPerpSweep.openCount, ()));
-            if (ok && ret.length >= 32 && abi.decode(ret, (uint256)) != 0) revert SweepGasStarved();
+            if (!ok || ret.length < 32) {
+                if (!sweepFailOpen) revert SweepUnavailable();
+            } else if (abi.decode(ret, (uint256)) != 0) {
+                revert SweepGasStarved();
+            }
         }
     }
 

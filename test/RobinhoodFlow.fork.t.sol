@@ -277,7 +277,11 @@ contract RobinhoodFlowForkTest is Test {
         uint256 share = address(pool).balance - p0;
         assertApproxEqAbs(share, harvested / 10, 2, "10% to the perps pool");
         emit log_named_decimal_uint("harvested", harvested, 18);
-        // the pool's ETH share pairs with coin it holds into more depth
+        // the pool's ETH share pairs with coin it holds into more depth, once the pool is back at the Pons price (the
+        // buy above moved Pons; compound refuses to pair off it): buys on the pool pull it there
+        PoolKey memory key = _key(pool);
+        for (uint256 i; i < 40 && hook.deviationBps() > 80; ++i) trader.swap{value: 0.01 ether}(key, true, -int256(0.01 ether));
+        assertLe(hook.deviationBps(), 100, "the pool is back at the Pons price");
         vm.prank(DEPLOYER);
         L.release(1_000_000 ether, address(pool));
         uint128 liq0 = pool.liquidity();

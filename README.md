@@ -66,6 +66,25 @@ opened at the Pons price, trades through the hook and the band, the fee split fe
 the liquidity back past a blocking and a broken engine, and a second hook opened with the same money. Pons taxes buys
 in the coin's launch block ~99% (anti-sniper; the launcher's own buy is exempt), 6.9% after.
 
+## The IMD swarm's audit (job ea1c84c3), fixed
+
+The swarm's five auditors found four medium and several low issues; every one is fixed and held by
+`test/AuditFixes.t.sol`:
+
+- `compound()` pairs the pool's idle funds only within 1% of the Pons price (`COMPOUND_MAX_DEV_BPS`): it can't be
+  sandwiched by a caller who just pushed the price.
+- The pre-trade sweep fails closed at any gas: a down engine at low gas reverts `SweepUnavailable` (unless the owner
+  sets fail-open), as it does at normal gas.
+- The band is judged on the price the trader left, read before the post-trade sweep (an engine's nested swap can't
+  hide a push, and its liquidations aren't rolled back by the band); "closer" means closer on the same side, so no swap
+  can cross the Pons price and end out of band on the other side; a price the band can't express reads as off scale.
+- The whole Pons read sits behind one try: an unreadable reference turns the band off, never halts trading; the owner
+  can repoint the curve (`pool.setCurve`).
+- No zero fee address, no zero curve or coin at `open`, a fee sink must be a contract, ownership can't be renounced
+  (it would strand the liquidity), ETH goes out with plain transfers (no forced-send forwarder), an addition reports its
+  principal (the fees the position earned stay in the pool), and a price outside the full range is `ZeroLiquidity`.
+- The dead skim setting is gone: `setBand(maxDeviationBps)`.
+
 ## Admission (what IMD checks, and the tests that check it first)
 
 `forge test`, offline, no RPC:

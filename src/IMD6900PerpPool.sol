@@ -24,6 +24,11 @@ interface IFeeSink {
     function addFees() external payable;
 }
 
+/// @notice IMD6900PerpHook: how far this pool sits from the Pons price
+interface IBandView {
+    function deviationBps() external view returns (uint256);
+}
+
 /// @title IMD6900PerpPool - IMD6900's perps pool on Robinhood Chain: ETH / coin, one full-range position, owned here
 /// @notice The perps engine trades against this pool (IMD6900PerpHook), and its capacity follows the pool's depth. The
 ///         owner opens it once the coin trades on Pons, at the price and with the ETH and coin it chooses, and anyone
@@ -59,6 +64,7 @@ contract IMD6900PerpPool is Ownable, ReentrancyGuard {
     event Compounded(uint128 liquidity, uint256 eth, uint256 tokens);
     event LiquidityRemoved(uint128 liquidity, uint256 eth, uint256 tokens, address ethTo, address tokensTo);
     event FeesForwarded(uint256 amount);
+    event CurveSet(address curve);
 
     error OnlyPoolManager();
     error HookAlreadySet();
@@ -67,6 +73,14 @@ contract IMD6900PerpPool is Ownable, ReentrancyGuard {
     error NotOpen();
     error ZeroLiquidity();
     error WouldLiquidate(uint256 id);
+    error ZeroAddress();
+    error NotAContract();
+    error OffPons(uint256 deviationBps);
+    error NoRenounce();
+
+    /// @notice compound() runs only this close to the Pons price: it pairs the pool's own idle ETH and coin at the
+    ///         spot price, so a caller who had just pushed the price would buy that pairing cheap
+    uint256 public constant COMPOUND_MAX_DEV_BPS = 100;
 
     constructor(IPoolManager poolManager_, uint24 poolFee_, address owner_) {
         poolManager = poolManager_;
@@ -75,6 +89,7 @@ contract IMD6900PerpPool is Ownable, ReentrancyGuard {
     }
 
     function setFeeSink(address feeSink_) external onlyOwner {
+        if (feeSink_ != address(0) && feeSink_.code.length == 0) revert NotAContract(); // a sink must take addFees()
         feeSink = feeSink_;
         emit FeeSinkSet(feeSink_);
     }
@@ -101,6 +116,18 @@ contract IMD6900PerpPool is Ownable, ReentrancyGuard {
         emit PerpEngineSet(engine);
     }
 
+    /// @notice Repoints the Pons reference (the coin's curve) if it was set wrong at the opening
+    function setCurve(address curve_) external onlyOwner {
+        if (curve_ == address(0)) revert ZeroAddress();
+        curve = curve_;
+        emit CurveSet(curve_);
+    }
+
+    /// @notice Ownership never goes to nobody: only the owner can take the liquidity out, so renouncing would strand it
+    function renounceOwnership() public payable override onlyOwner {
+        revert NoRenounce();
+    }
+
     /// @notice Takes `liq` of the liquidity out: its ETH to `ethTo`, its coin to `tokensTo`. Reverts if any open
     ///         position would then be liquidatable (close or liquidate it first, or remove less).
     function removeLiquidity(uint128 liq, address ethTo, address tokensTo) external onlyOwner nonReentrant {
@@ -113,7 +140,7 @@ contract IMD6900PerpPool is Ownable, ReentrancyGuard {
                 if (IPerpBookView(engine).isLiquidatable(ids[i])) revert WouldLiquidate(ids[i]);
             }
         }
-        SafeTransferLib.forceSafeTransferETH(ethTo, eth);
+        SafeTransferLib.safeTransferETH(ethTo, eth);
         SafeTransferLib.safeTransfer(token, tokensTo, tokens);
         emit LiquidityRemoved(liq, eth, tokens, ethTo, tokensTo);
     }
@@ -129,6 +156,7 @@ contract IMD6900PerpPool is Ownable, ReentrancyGuard {
     {
         if (hook == address(0)) revert NoHook();
         if (token != address(0)) revert AlreadyOpen();
+        if (token_ == address(0) || curve_ == address(0)) revert ZeroAddress();
         token = token_;
         curve = curve_;
         SafeTransferLib.safeTransferFrom(token_, msg.sender, address(this), tokenAmount);
@@ -136,7 +164,7 @@ contract IMD6900PerpPool is Ownable, ReentrancyGuard {
         uint128 liq = _fullRangeLiquidity(sqrtPriceX96, msg.value, tokenAmount);
         if (liq == 0) revert ZeroLiquidity();
         (uint256 ethIn, uint256 tokensIn) = _modify(int256(uint256(liq)));
-        if (msg.value > ethIn) SafeTransferLib.forceSafeTransferETH(msg.sender, msg.value - ethIn);
+        if (msg.value > ethIn) SafeTransferLib.safeTransferETH(msg.sender, msg.value - ethIn);
         if (tokenAmount > tokensIn) SafeTransferLib.safeTransfer(token_, msg.sender, tokenAmount - tokensIn);
         emit Opened(sqrtPriceX96, ethIn, tokensIn, liq);
     }
@@ -152,7 +180,7 @@ contract IMD6900PerpPool is Ownable, ReentrancyGuard {
         uint128 liq = _fullRangeLiquidity(sqrtPriceX96, msg.value, tokenAmount);
         if (liq == 0) revert ZeroLiquidity();
         (uint256 ethIn, uint256 tokensIn) = _modify(int256(uint256(liq)));
-        if (msg.value > ethIn) SafeTransferLib.forceSafeTransferETH(refundTo, msg.value - ethIn);
+        if (msg.value > ethIn) SafeTransferLib.safeTransferETH(refundTo, msg.value - ethIn);
         if (tokenAmount > tokensIn) SafeTransferLib.safeTransfer(token, refundTo, tokenAmount - tokensIn);
         emit LiquidityAdded(msg.sender, liq, ethIn, tokensIn);
     }
@@ -164,6 +192,8 @@ contract IMD6900PerpPool is Ownable, ReentrancyGuard {
     ///      pool's own. This is what turns the fee share and the skim into depth.
     function compound(uint256 minEth, uint256 minTokens) external nonReentrant returns (uint128 liq) {
         if (token == address(0)) revert NotOpen();
+        uint256 dev = IBandView(hook).deviationBps();
+        if (dev > COMPOUND_MAX_DEV_BPS) revert OffPons(dev);
         uint256 ethHave = address(this).balance;
         uint256 tokensHave = SafeTransferLib.balanceOf(token, address(this));
         if (ethHave < minEth || tokensHave < minTokens) revert ZeroLiquidity();
@@ -194,7 +224,7 @@ contract IMD6900PerpPool is Ownable, ReentrancyGuard {
         if (msg.sender != address(poolManager)) revert OnlyPoolManager();
         int256 liquidityDelta = abi.decode(data, (int256));
         PoolKey memory key = poolKey();
-        (BalanceDelta delta,) = poolManager.modifyLiquidity(
+        (BalanceDelta delta, BalanceDelta fees) = poolManager.modifyLiquidity(
             key,
             ModifyLiquidityParams(
                 TickMath.minUsableTick(TICK_SPACING), TickMath.maxUsableTick(TICK_SPACING), liquidityDelta, 0
@@ -213,6 +243,9 @@ contract IMD6900PerpPool is Ownable, ReentrancyGuard {
         } else if (a1 > 0) {
             poolManager.take(key.currency1, address(this), uint256(uint128(a1)));
         }
+        // what the change was worth: an addition's principal (the fees the position had earned stay here, for compound),
+        // a removal's principal and fees together (all of it goes out)
+        if (liquidityDelta > 0) return abi.encode(_abs(a0 - fees.amount0()), _abs(a1 - fees.amount1()));
         return abi.encode(_abs(a0), _abs(a1));
     }
 
@@ -229,6 +262,7 @@ contract IMD6900PerpPool is Ownable, ReentrancyGuard {
     function _fullRangeLiquidity(uint160 sqrtPriceX96, uint256 eth, uint256 tokens) internal pure returns (uint128) {
         uint160 lower = TickMath.getSqrtPriceAtTick(TickMath.minUsableTick(TICK_SPACING));
         uint160 upper = TickMath.getSqrtPriceAtTick(TickMath.maxUsableTick(TICK_SPACING));
+        if (sqrtPriceX96 <= lower || sqrtPriceX96 >= upper) return 0; // outside the full range: nothing to add (ZeroLiquidity)
         uint256 fromEth = FullMath.mulDiv(eth, FullMath.mulDiv(sqrtPriceX96, upper, 1 << 96), upper - sqrtPriceX96);
         uint256 fromTokens = FullMath.mulDiv(tokens, 1 << 96, sqrtPriceX96 - lower);
         uint256 l = fromEth < fromTokens ? fromEth : fromTokens;
